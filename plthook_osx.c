@@ -158,6 +158,10 @@ typedef struct {
     int addend;
     char weak;
     void **addr;
+    char auth;       /* slot holds a signed pointer (arm64e) */
+    uint8_t key;     /* ptrauth key when auth */
+    uint16_t diversity;
+    char addr_div;
 } bind_address_t;
 
 typedef struct mem_prot {
@@ -856,6 +860,17 @@ next_page:
             offset = 0;
         }
         break;
+    case DYLD_CHAINED_PTR_ARM64E:
+    case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+    case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+        /* arm64e chains step in 8-byte units, and the auth bit picks the layout */
+        if (entry->ptr.arm64e_bind.next) {
+            offset += entry->ptr.arm64e_bind.next * 8;
+        } else {
+            j++;
+            offset = 0;
+        }
+        break;
     default:
         set_errmsg("unsupported pointer format %u in %s", seg->pointer_format, iter->image_name);
         return PLTHOOK_INTERNAL_ERROR;
@@ -864,6 +879,40 @@ next_page:
     iter->page_index = j;
     iter->offset = offset;
     return 0;
+}
+
+
+/* An arm64e chain entry carries its own layout. Report whether it binds, and
+   pull out the import ordinal and the signing details when it does. */
+static int arm64e_bind_info(const chianed_fixups_entry_t *entry, uint32_t *ordinal,
+                            int *is_auth, uint8_t *key, uint16_t *diversity, uint8_t *addr_div)
+{
+    int wide = (entry->ptr_format == DYLD_CHAINED_PTR_ARM64E_USERLAND24);
+
+    if (!entry->ptr.arm64e_bind.bind) {
+        return 0;
+    }
+    if (entry->ptr.arm64e_bind.auth) {
+        *is_auth = 1;
+        *key = wide ? entry->ptr.arm64e_auth_bind24.key : entry->ptr.arm64e_auth_bind.key;
+        *diversity = wide ? entry->ptr.arm64e_auth_bind24.diversity : entry->ptr.arm64e_auth_bind.diversity;
+        *addr_div = wide ? entry->ptr.arm64e_auth_bind24.addrDiv : entry->ptr.arm64e_auth_bind.addrDiv;
+        *ordinal = wide ? entry->ptr.arm64e_auth_bind24.ordinal : entry->ptr.arm64e_auth_bind.ordinal;
+    } else {
+        *is_auth = 0;
+        *key = 0;
+        *diversity = 0;
+        *addr_div = 0;
+        *ordinal = wide ? entry->ptr.arm64e_bind24.ordinal : entry->ptr.arm64e_bind.ordinal;
+    }
+    return 1;
+}
+
+static int entry_is_arm64e(const chianed_fixups_entry_t *entry)
+{
+    return entry->ptr_format == DYLD_CHAINED_PTR_ARM64E
+        || entry->ptr_format == DYLD_CHAINED_PTR_ARM64E_USERLAND
+        || entry->ptr_format == DYLD_CHAINED_PTR_ARM64E_USERLAND24;
 }
 
 static int read_chained_fixups(data_t *d, const struct mach_header *mh, const char *image_name)
@@ -913,6 +962,8 @@ static int read_chained_fixups(data_t *d, const struct mach_header *mh, const ch
     num_binds = 0;
     while ((rv = chained_fixups_iter_next(&iter, &entry)) == 0) {
         if (entry.ptr_format == DYLD_CHAINED_PTR_64_OFFSET && entry.ptr.bind.bind) {
+            num_binds++;
+        } else if (entry_is_arm64e(&entry) && entry.ptr.arm64e_bind.bind) {
             num_binds++;
         }
 #if 0
@@ -999,6 +1050,34 @@ static int read_chained_fixups(data_t *d, const struct mach_header *mh, const ch
                 DEBUG_FIXUPS(" [weak-import]");
             }
             DEBUG_FIXUPS("\n");
+            num_binds++;
+        } else if (entry_is_arm64e(&entry) && entry.ptr.arm64e_bind.bind) {
+            uint32_t ordinal = 0, name_offset;
+            int is_auth = 0;
+            uint8_t key = 0, addr_div = 0;
+            uint16_t diversity = 0;
+            bind_address_t *bind_addr = &d->plthook->entries[num_binds];
+
+            arm64e_bind_info(&entry, &ordinal, &is_auth, &key, &diversity, &addr_div);
+            if (header->imports_format != DYLD_CHAINED_IMPORT) {
+                set_errmsg("unsupported imports format %u", header->imports_format);
+                rv = PLTHOOK_INTERNAL_ERROR;
+                goto cleanup;
+            }
+            if (ordinal >= header->imports_count) {
+                set_errmsg("import ordinal %u out of range in %s", ordinal, image_name);
+                rv = PLTHOOK_INVALID_FILE_FORMAT;
+                goto cleanup;
+            }
+            name_offset = import[ordinal].name_offset;
+            bind_addr->name = symbol_pool + name_offset;
+            bind_addr->addr = (void**)fileoff_to_vmaddr(d, entry.offset);
+            bind_addr->addend = 0;
+            bind_addr->weak = import[ordinal].weak_import;
+            bind_addr->auth = (char)is_auth;
+            bind_addr->key = key;
+            bind_addr->diversity = diversity;
+            bind_addr->addr_div = (char)addr_div;
             num_binds++;
         } else if (entry.ptr_format == DYLD_CHAINED_PTR_64_OFFSET && !entry.ptr.bind.bind) {
             DEBUG_FIXUPS("        %-12s %-16s 0x%08llX            rebase  0x%08llX\n",
@@ -1145,11 +1224,45 @@ int plthook_enum_entry(plthook_t *plthook, unsigned int *pos, plthook_entry_t *e
         entry->addend = plthook->entries[*pos].addend;
         entry->prot = get_mem_prot(plthook, entry->addr);
         entry->weak = plthook->entries[*pos].weak;
+        entry->auth = plthook->entries[*pos].auth;
+        entry->key = plthook->entries[*pos].key;
+        entry->diversity = plthook->entries[*pos].diversity;
+        entry->addr_div = plthook->entries[*pos].addr_div;
         (*pos)++;
         return 0;
     }
     return EOF;
 }
+
+
+#if defined(__arm64e__) && __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+
+/* A slot in __auth_got holds a signed pointer. Writing a raw one makes the
+   next call through it fault, so sign it the same way dyld did. */
+static void *sign_for_slot(void *func, void **slot, unsigned char key,
+                           unsigned short diversity, char addr_div)
+{
+    void *raw = ptrauth_strip(func, ptrauth_key_function_pointer);
+    uintptr_t disc = addr_div
+        ? ptrauth_blend_discriminator(slot, diversity)
+        : (uintptr_t)diversity;
+
+    switch (key) {
+    case 0: return ptrauth_sign_unauthenticated(raw, ptrauth_key_asia, disc);
+    case 1: return ptrauth_sign_unauthenticated(raw, ptrauth_key_asib, disc);
+    case 2: return ptrauth_sign_unauthenticated(raw, ptrauth_key_asda, disc);
+    default: return ptrauth_sign_unauthenticated(raw, ptrauth_key_asdb, disc);
+    }
+}
+
+/* Hand the caller something it can call, not a slot-signed pointer. */
+static void *unsign_from_slot(void *stored)
+{
+    return ptrauth_sign_unauthenticated(ptrauth_strip(stored, ptrauth_key_asia),
+                                        ptrauth_key_function_pointer, 0);
+}
+#endif
 
 int plthook_replace(plthook_t *plthook, const char *funcname, void *funcaddr, void **oldfunc)
 {
@@ -1190,8 +1303,17 @@ int plthook_replace(plthook_t *plthook, const char *funcname, void *funcaddr, vo
         continue;
 matched:
         if (oldfunc) {
+#if defined(__arm64e__) && __has_include(<ptrauth.h>)
+            *oldfunc = entry.auth ? unsign_from_slot(*addr) : *addr;
+#else
             *oldfunc = *addr;
+#endif
         }
+#if defined(__arm64e__) && __has_include(<ptrauth.h>)
+        if (entry.auth) {
+            funcaddr = sign_for_slot(funcaddr, addr, entry.key, entry.diversity, entry.addr_div);
+        }
+#endif
         if (!(entry.prot & PROT_WRITE)) {
             size_t page_size = sysconf(_SC_PAGESIZE);
             void *base = (void*)((size_t)addr & ~(page_size - 1));
