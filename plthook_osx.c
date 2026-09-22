@@ -43,6 +43,8 @@
 #include <errno.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <mach-o/fat.h>
+#include <libkern/OSByteOrder.h>
 #include <sys/mman.h>
 #include <mach-o/fixup-chains.h>
 #include "plthook.h"
@@ -674,6 +676,7 @@ typedef struct {
     uint32_t seg_index; // i
     uint16_t page_index; // j
     off_t offset;
+    off_t slice_offset;
 } chained_fixups_iter_t;
 
 typedef struct {
@@ -692,12 +695,40 @@ typedef struct {
     off_t offset;
 } chianed_fixups_entry_t;
 
-static int chained_fixups_iter_init(chained_fixups_iter_t *iter, const char *image_name, const struct dyld_chained_starts_in_image *starts_offset);
+static int chained_fixups_iter_init(chained_fixups_iter_t *iter, const char *image_name, const struct mach_header *mh, const struct dyld_chained_starts_in_image *starts_offset);
 static void chained_fixups_iter_deinit(chained_fixups_iter_t *iter);
 static int chained_fixups_iter_rewind(chained_fixups_iter_t *iter);
 static int chained_fixups_iter_next(chained_fixups_iter_t *iter, chianed_fixups_entry_t *entry);
 
-static int chained_fixups_iter_init(chained_fixups_iter_t *iter, const char *image_name, const struct dyld_chained_starts_in_image *starts)
+
+/* Load-command file offsets are relative to the slice. In a universal file the
+   slice does not start at zero, so reads must be biased by where it does. */
+static off_t slice_offset_in_file(FILE *fp, const struct mach_header *mh)
+{
+    struct fat_header fh;
+    uint32_t i, nfat;
+
+    if (fseeko(fp, 0, SEEK_SET) != 0 || fread(&fh, sizeof(fh), 1, fp) != 1) {
+        return 0;
+    }
+    if (OSSwapBigToHostInt32(fh.magic) != FAT_MAGIC) {
+        return 0; /* thin file */
+    }
+    nfat = OSSwapBigToHostInt32(fh.nfat_arch);
+    for (i = 0; i < nfat; i++) {
+        struct fat_arch fa;
+        if (fread(&fa, sizeof(fa), 1, fp) != 1) {
+            return 0;
+        }
+        if ((cpu_type_t)OSSwapBigToHostInt32(fa.cputype) == mh->cputype
+            && (cpu_subtype_t)OSSwapBigToHostInt32(fa.cpusubtype) == mh->cpusubtype) {
+            return (off_t)OSSwapBigToHostInt32(fa.offset);
+        }
+    }
+    return 0;
+}
+
+static int chained_fixups_iter_init(chained_fixups_iter_t *iter, const char *image_name, const struct mach_header *mh, const struct dyld_chained_starts_in_image *starts)
 {
     memset(iter, 0, sizeof(*iter));
     iter->fp = fopen(image_name, "r");
@@ -707,6 +738,7 @@ static int chained_fixups_iter_init(chained_fixups_iter_t *iter, const char *ima
     }
     iter->image_name = image_name;
     iter->starts = starts;
+    iter->slice_offset = slice_offset_in_file(iter->fp, mh);
     return 0;
 }
 
@@ -778,7 +810,7 @@ next_page:
     if (offset == 0) {
         offset = seg->segment_offset + j * seg->page_size + seg->page_start[j];
     }
-    if (fseeko(iter->fp, offset, SEEK_SET) != 0) {
+    if (fseeko(iter->fp, iter->slice_offset + offset, SEEK_SET) != 0) {
         set_errmsg("failed to seek to %lld in %s", offset, iter->image_name);
         return PLTHOOK_INVALID_FILE_FORMAT;
     }
@@ -820,7 +852,7 @@ static int read_chained_fixups(data_t *d, const struct mach_header *mh, const ch
     chained_fixups_iter_t iter = {NULL, };
     chianed_fixups_entry_t entry;
 
-    rv = chained_fixups_iter_init(&iter, image_name, starts);
+    rv = chained_fixups_iter_init(&iter, image_name, mh, starts);
     if (rv != 0) {
         return rv;
     }
