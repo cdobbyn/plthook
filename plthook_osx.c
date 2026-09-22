@@ -1309,9 +1309,12 @@ matched:
             *oldfunc = *addr;
 #endif
         }
+        /* Signing depends on the slot, so derive it per slot and leave
+           funcaddr alone. */
+        void *towrite = funcaddr;
 #if defined(__arm64e__) && __has_include(<ptrauth.h>)
         if (entry.auth) {
-            funcaddr = sign_for_slot(funcaddr, addr, entry.key, entry.diversity, entry.addr_div);
+            towrite = sign_for_slot(funcaddr, addr, entry.key, entry.diversity, entry.addr_div);
         }
 #endif
         if (!(entry.prot & PROT_WRITE)) {
@@ -1321,10 +1324,10 @@ matched:
                 set_errmsg("Cannot change memory protection at address %p", base);
                 return PLTHOOK_INTERNAL_ERROR;
             }
-            *addr = funcaddr;
+            *addr = towrite;
             mprotect(base, page_size, entry.prot);
         } else {
-            *addr = funcaddr;
+            *addr = towrite;
         }
         return 0;
     }
