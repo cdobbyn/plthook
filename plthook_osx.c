@@ -719,23 +719,37 @@ static int chained_fixups_iter_next(chained_fixups_iter_t *iter, chianed_fixups_
 static off_t slice_offset_in_file(FILE *fp, const struct mach_header *mh)
 {
     struct fat_header fh;
-    uint32_t i, nfat;
+    uint32_t i, nfat, magic;
+    int is_fat64;
 
     if (fseeko(fp, 0, SEEK_SET) != 0 || fread(&fh, sizeof(fh), 1, fp) != 1) {
         return 0;
     }
-    if (OSSwapBigToHostInt32(fh.magic) != FAT_MAGIC) {
+    magic = OSSwapBigToHostInt32(fh.magic);
+    if (magic != FAT_MAGIC && magic != FAT_MAGIC_64) {
         return 0; /* thin file */
     }
+    is_fat64 = (magic == FAT_MAGIC_64);
     nfat = OSSwapBigToHostInt32(fh.nfat_arch);
     for (i = 0; i < nfat; i++) {
-        struct fat_arch fa;
-        if (fread(&fa, sizeof(fa), 1, fp) != 1) {
-            return 0;
-        }
-        if ((cpu_type_t)OSSwapBigToHostInt32(fa.cputype) == mh->cputype
-            && (cpu_subtype_t)OSSwapBigToHostInt32(fa.cpusubtype) == mh->cpusubtype) {
-            return (off_t)OSSwapBigToHostInt32(fa.offset);
+        if (is_fat64) {
+            struct fat_arch_64 fa;
+            if (fread(&fa, sizeof(fa), 1, fp) != 1) {
+                return 0;
+            }
+            if ((cpu_type_t)OSSwapBigToHostInt32(fa.cputype) == mh->cputype
+                && (cpu_subtype_t)OSSwapBigToHostInt32(fa.cpusubtype) == mh->cpusubtype) {
+                return (off_t)OSSwapBigToHostInt64(fa.offset);
+            }
+        } else {
+            struct fat_arch fa;
+            if (fread(&fa, sizeof(fa), 1, fp) != 1) {
+                return 0;
+            }
+            if ((cpu_type_t)OSSwapBigToHostInt32(fa.cputype) == mh->cputype
+                && (cpu_subtype_t)OSSwapBigToHostInt32(fa.cpusubtype) == mh->cpusubtype) {
+                return (off_t)OSSwapBigToHostInt32(fa.offset);
+            }
         }
     }
     return 0;
